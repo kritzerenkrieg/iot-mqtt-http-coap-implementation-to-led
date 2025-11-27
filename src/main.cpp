@@ -20,13 +20,22 @@ const char* WIFI_PASS = "susuputih";
 const int LED_MQTT = 23;
 const int LED_COAP = 22;
 const int LED_HTTP = 21;
+const int LED_PROXIMITY = 2;   // 4th LED for proximity indicator
+
+// Ultrasonic sensor pins
+const int TRIG_PIN = 19;
+const int ECHO_PIN = 18;
+
+// Proximity threshold in cm
+const long PROXIMITY_THRESHOLD_CM = 10;
 
 // ----------------------------------------------------
 // MQTT
 // ----------------------------------------------------
 const char* MQTT_HOST = "kritz.my.id";
 const uint16_t MQTT_PORT = 1883;
-const char* MQTT_TOPIC = "kritz/led/mqtt";
+const char* MQTT_TOPIC_LED = "kritz/led/mqtt";
+const char* MQTT_TOPIC_SENSOR = "kritz/sensor/distance";
 
 WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
@@ -37,7 +46,7 @@ PubSubClient mqttClient(wifiClient);
 const char* STATES_URL = "https://kritz.my.id/states";
 
 unsigned long lastPollMillis = 0;
-const unsigned long POLL_INTERVAL_MS = 2000;  // Increased to reduce load
+const unsigned long POLL_INTERVAL_MS = 2000;
 
 // ----------------------------------------------------
 // CoAP Client Polling
@@ -48,7 +57,16 @@ WiFiUDP coapUdp;
 Coap coapClient(coapUdp);
 
 unsigned long lastCoapPollMillis = 0;
-const unsigned long COAP_POLL_INTERVAL_MS = 3000;  // Increased to reduce load
+const unsigned long COAP_POLL_INTERVAL_MS = 3000;
+
+// ----------------------------------------------------
+// Ultrasonic Sensor
+// ----------------------------------------------------
+unsigned long lastSensorReadMillis = 0;
+const unsigned long SENSOR_READ_INTERVAL_MS = 500;  // Read every 500ms
+
+unsigned long lastSensorPublishMillis = 0;
+const unsigned long SENSOR_PUBLISH_INTERVAL_MS = 2000;  // Publish every 2s
 
 // ----------------------------------------------------
 // Local HTTP Debug Server
@@ -65,6 +83,9 @@ void pollStates();
 void pollCoapState();
 void handleLocalHttpLed();
 void coapResponse(CoapPacket &packet, IPAddress ip, int port);
+long readUltrasonicCM();
+void processUltrasonicReading();
+void publishSensorData(long distance, bool proximity);
 
 // ----------------------------------------------------
 // Setup
@@ -76,10 +97,15 @@ void setup() {
   pinMode(LED_MQTT, OUTPUT);
   pinMode(LED_COAP, OUTPUT);
   pinMode(LED_HTTP, OUTPUT);
+  pinMode(LED_PROXIMITY, OUTPUT);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
 
   digitalWrite(LED_MQTT, LOW);
   digitalWrite(LED_COAP, LOW);
   digitalWrite(LED_HTTP, LOW);
+  digitalWrite(LED_PROXIMITY, LOW);
 
   // -------- WiFi --------
   WiFi.mode(WIFI_STA);
@@ -118,8 +144,13 @@ void setup() {
   Serial.println("CoAP client initialized");
   Serial.println("  Will poll coap://kritz.my.id:5683/led");
 
+  Serial.println("Ultrasonic sensor initialized");
+  Serial.printf("  Proximity threshold: %ld cm\n", PROXIMITY_THRESHOLD_CM);
+
   lastPollMillis = millis();
   lastCoapPollMillis = millis();
+  lastSensorReadMillis = millis();
+  lastSensorPublishMillis = millis();
 }
 
 // ----------------------------------------------------
@@ -154,6 +185,12 @@ void loop() {
     pollCoapState();
   }
 
+  // Ultrasonic sensor reading
+  if (millis() - lastSensorReadMillis >= SENSOR_READ_INTERVAL_MS) {
+    lastSensorReadMillis = millis();
+    processUltrasonicReading();
+  }
+
   // Local HTTP debug
   server.handleClient();
 
@@ -163,6 +200,89 @@ void loop() {
   delay(1);
 }
 
+// ----------------------------------------------------
+// Ultrasonic Sensor Functions
+// ----------------------------------------------------
+long readUltrasonicCM() {
+  // Ensure trigger LOW
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  
+  // Trigger pulse
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(TRIG_PIN, LOW);
+  
+  // Read echo pulse (timeout ~38 ms)
+  unsigned long duration = pulseIn(ECHO_PIN, HIGH, 38000UL);
+  
+  if (duration == 0) {
+    return -1; // timeout
+  }
+  
+  long distance = duration * 0.034 / 2; // cm
+  return distance;
+}
+
+void processUltrasonicReading() {
+  static long lastDistance = -1;
+  static bool lastProximity = false;
+  
+  long distance = readUltrasonicCM();
+  
+  if (distance > 0) {
+    bool proximity = (distance <= PROXIMITY_THRESHOLD_CM);
+    
+    // Update proximity LED
+    digitalWrite(LED_PROXIMITY, proximity ? HIGH : LOW);
+    
+    // Only print when value changes significantly or proximity state changes
+    if (abs(distance - lastDistance) > 2 || proximity != lastProximity) {
+      Serial.print("Distance: ");
+      Serial.print(distance);
+      Serial.print(" cm");
+      if (proximity) {
+        Serial.println(" [PROXIMITY TRIGGERED]");
+      } else {
+        Serial.println();
+      }
+      
+      lastDistance = distance;
+      lastProximity = proximity;
+    }
+    
+    // Publish to MQTT periodically
+    if (millis() - lastSensorPublishMillis >= SENSOR_PUBLISH_INTERVAL_MS) {
+      lastSensorPublishMillis = millis();
+      publishSensorData(distance, proximity);
+    }
+  } else {
+    // Timeout - turn off proximity LED
+    digitalWrite(LED_PROXIMITY, LOW);
+  }
+}
+
+void publishSensorData(long distance, bool proximity) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+  
+  // Create JSON payload
+  StaticJsonDocument<128> doc;
+  doc["distance"] = distance;
+  doc["proximity"] = proximity;
+  
+  char buffer[128];
+  serializeJson(doc, buffer);
+  
+  // Publish to MQTT
+  if (mqttClient.publish(MQTT_TOPIC_SENSOR, buffer)) {
+    Serial.print("Published sensor data: ");
+    Serial.println(buffer);
+  } else {
+    Serial.println("Failed to publish sensor data");
+  }
+}
 
 // ----------------------------------------------------
 // MQTT CALLBACK
@@ -183,11 +303,46 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
   }
   Serial.println(msg);
 
-  int st = msg.toInt();
-  if (st == 1) digitalWrite(LED_MQTT, HIGH);
-  else digitalWrite(LED_MQTT, LOW);
+  // Only handle LED topic
+  if (strcmp(topic, MQTT_TOPIC_LED) == 0) {
+    int st = msg.toInt();
+    if (st == 1) digitalWrite(LED_MQTT, HIGH);
+    else digitalWrite(LED_MQTT, LOW);
+    Serial.printf("Set LED_MQTT (D%d) -> %d\n", LED_MQTT, st);
+  }
+}
 
-  Serial.printf("Set LED_MQTT (D%d) -> %d\n", LED_MQTT, st);
+// ----------------------------------------------------
+// MQTT Connect
+// ----------------------------------------------------
+void mqttConnect() {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi not connected, skip MQTT connect");
+    return;
+  }
+
+  static unsigned long lastAttempt = 0;
+  if (millis() - lastAttempt < 2000) return;
+  lastAttempt = millis();
+
+  Serial.print("Connecting to MQTT broker ");
+  Serial.print(MQTT_HOST);
+  Serial.print(":");
+  Serial.println(MQTT_PORT);
+
+  String clientId = "esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
+  if (mqttClient.connect(clientId.c_str())) {
+    Serial.println("MQTT connected");
+    mqttClient.subscribe(MQTT_TOPIC_LED);
+    Serial.print("Subscribed to ");
+    Serial.println(MQTT_TOPIC_LED);
+    
+    // Fetch initial state after connecting
+    fetchInitialMqttState();
+  } else {
+    Serial.print("MQTT connect failed, rc=");
+    Serial.println(mqttClient.state());
+  }
 }
 
 // ----------------------------------------------------
@@ -196,7 +351,6 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
 void fetchInitialMqttState() {
   Serial.println("Fetching initial MQTT state...");
   
-  // Create a fresh SSL client for this request
   WiFiClientSecure* client = new WiFiClientSecure;
   if (!client) {
     Serial.println("Failed to create SSL client");
@@ -233,40 +387,6 @@ void fetchInitialMqttState() {
 }
 
 // ----------------------------------------------------
-// MQTT Connect
-// ----------------------------------------------------
-void mqttConnect() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("WiFi not connected, skip MQTT connect");
-    return;
-  }
-
-  static unsigned long lastAttempt = 0;
-  if (millis() - lastAttempt < 2000) return;
-  lastAttempt = millis();
-
-  Serial.print("Connecting to MQTT broker ");
-  Serial.print(MQTT_HOST);
-  Serial.print(":");
-  Serial.println(MQTT_PORT);
-
-  String clientId = "esp32-" + String((uint32_t)ESP.getEfuseMac(), HEX);
-  if (mqttClient.connect(clientId.c_str())) {
-    Serial.println("MQTT connected");
-    mqttClient.subscribe(MQTT_TOPIC);
-    Serial.print("Subscribed to ");
-    Serial.println(MQTT_TOPIC);
-    
-    // Fetch initial state after connecting
-    fetchInitialMqttState();
-  } else {
-    Serial.print("MQTT connect failed, rc=");
-    Serial.println(mqttClient.state());
-  }
-}
-
-
-// ----------------------------------------------------
 // HTTP POLL HANDLER
 // ----------------------------------------------------
 void pollStates() {
@@ -276,7 +396,6 @@ void pollStates() {
     return;
   }
 
-  // Create a fresh SSL client for each request
   WiFiClientSecure* client = new WiFiClientSecure;
   if (!client) {
     Serial.println("Failed to create SSL client");
@@ -295,13 +414,11 @@ void pollStates() {
   if (code == 200) {
     String payload = https.getString();
 
-    // Parse JSON
     const size_t CAPACITY = JSON_OBJECT_SIZE(3) + 60;
     StaticJsonDocument<CAPACITY> doc;
     DeserializationError err = deserializeJson(doc, payload);
 
     if (!err) {
-      // Only control HTTP LED from polling
       if (doc.containsKey("http")) {
         int http_state = doc["http"];
         int current = digitalRead(LED_HTTP);
@@ -324,7 +441,6 @@ void pollStates() {
   delete client;
 }
 
-
 // ----------------------------------------------------
 // CoAP POLL HANDLER
 // ----------------------------------------------------
@@ -333,13 +449,9 @@ void pollCoapState() {
     return;
   }
 
-  // Serial.println("Polling CoAP state...");
-  
-  // Resolve hostname to IP (cache this to avoid repeated DNS lookups)
   static IPAddress serverIP;
   static unsigned long lastDnsLookup = 0;
   
-  // Only do DNS lookup once every 5 minutes or if IP is not set
   if (serverIP == IPAddress(0,0,0,0) || millis() - lastDnsLookup > 300000) {
     if (!WiFi.hostByName(COAP_HOST, serverIP)) {
       Serial.println("CoAP: DNS lookup failed");
@@ -350,7 +462,6 @@ void pollCoapState() {
     Serial.println(serverIP);
   }
 
-  // Send GET request
   int msgid = coapClient.get(serverIP, COAP_PORT, "led");
   
   if (msgid == 0) {
@@ -358,32 +469,22 @@ void pollCoapState() {
   }
 }
 
-
 // ----------------------------------------------------
 // CoAP RESPONSE HANDLER
 // ----------------------------------------------------
 void coapResponse(CoapPacket &packet, IPAddress ip, int port) {
-  // Serial.print("CoAP response from ");
-  // Serial.print(ip);
-  // Serial.print(":");
-  // Serial.println(port);
-
-  // Extract payload
   char payload[packet.payloadlen + 1];
   memcpy(payload, packet.payload, packet.payloadlen);
   payload[packet.payloadlen] = '\0';
 
-  // Parse state
   int state = atoi(payload);
   
-  // Only update if state changed
   int current = digitalRead(LED_COAP);
   if ((state ? HIGH : LOW) != current) {
     digitalWrite(LED_COAP, state ? HIGH : LOW);
     Serial.printf("CoAP LED changed to: %d\n", state);
   }
 }
-
 
 // ----------------------------------------------------
 // Local HTTP Debug
